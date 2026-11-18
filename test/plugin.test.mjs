@@ -2,6 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
 import { gunzipSync } from "node:zlib"
+import { randomBytes } from "node:crypto"
 
 import { CodeBuddyPlugin, CodeBuddyIntlPlugin } from "../index.mjs"
 import { makePlugin, usable, expired } from "../lib/plugin.mjs"
@@ -544,6 +545,188 @@ test("x-magpie-session 不泄露给上游，但被用来派生请求 id", async 
   }
 })
 
+// ---- 11128 的兜底重发（实测 2026-11-18）--------------------------------------
+//
+// 实测："You are Claude Code, Anthropic's official CLI for Claude." 放 system 里
+// 400/11128；同一句包进 user 消息的 <instructions> 里 200（无标签直放 user 也 200）。
+// 所以表与逗号都没盖住的 agent 开场行，靠「把 system 搬进 user」也能过。
+test("11128 时把 system 提示词搬进 user 消息再发一次，第二次就过", async () => {
+  const bodies = []
+  const { server, base } = await startServer((req, raw, res) => {
+    const body = JSON.parse(bodyOf(req, raw))
+    bodies.push(body)
+    // 第一次：system 里还有那句被拒的话 -> 11128；第二次（搬进 user）-> 200
+    const stillSystem = body.messages.some((m) => m.role === "system" && /Claude Code/.test(String(m.content)))
+    if (stillSystem) {
+      res.statusCode = 400
+      res.setHeader("Content-Type", "application/json")
+      res.end(JSON.stringify({ code: 11128, msg: "Illegal API invocation from an unapproved channel" }))
+      return
+    }
+    sse(res)
+  })
+  try {
+    const auth = { type: "oauth", access: "AT", refresh: "", expires: 0, uid: "U1" }
+    const { options } = await pluginFor(localSite(SITES.codebuddy, base), auth)
+    const res = await options.fetch(base + "/v2/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "glm-5.3",
+        // 用一个 FLAGGED 与逗号都盖不住的 agent 开场行
+        messages: [{ role: "system", content: "You are Claude Code." }, { role: "user", content: "hi" }],
+      }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(bodies.length, 2)
+    // 第一次原样（首条 system 就是那句）
+    assert.equal(bodies[0].messages[0].role, "system")
+    // 第二次：system 槽是兜底提示词，原话包在 user 消息的 <instructions> 里
+    assert.equal(bodies[1].messages[0].role, "system")
+    assert.equal(bodies[1].messages[0].content, "You are a helpful assistant.")
+    const user = bodies[1].messages.find((m) => m.role === "user")
+    assert.match(user.content, /<instructions>\nYou are Claude Code\.\n<\/instructions>/)
+  } finally {
+    server.close()
+  }
+})
+
+test("被拒过的 system 提示词，下一轮直接以搬过的形态发，不再先被拒一次", async () => {
+  const bodies = []
+  const { server, base } = await startServer((req, raw, res) => {
+    const body = JSON.parse(bodyOf(req, raw))
+    bodies.push(body)
+    const stillSystem = body.messages.some((m) => m.role === "system" && /Claude Code/.test(String(m.content)))
+    if (stillSystem) {
+      res.statusCode = 400
+      res.setHeader("Content-Type", "application/json")
+      res.end(JSON.stringify({ code: 11128, msg: "Illegal API invocation from an unapproved channel" }))
+      return
+    }
+    sse(res)
+  })
+  try {
+    const auth = { type: "oauth", access: "AT", refresh: "", expires: 0, uid: "U1" }
+    const { options } = await pluginFor(localSite(SITES.codebuddy, base), auth)
+    const body = JSON.stringify({ model: "glm-5.3", messages: [{ role: "system", content: "You are Claude Code." }, { role: "user", content: "hi" }] })
+    await options.fetch(base + "/v2/chat/completions", { method: "POST", body })
+    const first = bodies.length
+    assert.equal(first, 2)
+    // 同一份 system 提示词再来一轮：只有一次请求，直接搬过
+    await options.fetch(base + "/v2/chat/completions", { method: "POST", body })
+    assert.equal(bodies.length, first + 1)
+    assert.equal(bodies[first].messages[0].content, "You are a helpful assistant.")
+  } finally {
+    server.close()
+  }
+})
+
+test("11128 但 chat 不是 JSON 时不死循环，把上游的话报回去", async () => {
+  let count = 0
+  const { server, base } = await startServer((req, raw, res) => {
+    count++
+    res.statusCode = 400
+    res.setHeader("Content-Type", "application/json")
+    res.end(JSON.stringify({ code: 11128, msg: "Illegal API invocation from an unapproved channel" }))
+  })
+  try {
+    const auth = { type: "oauth", access: "AT", refresh: "", expires: 0, uid: "U1" }
+    const { options } = await pluginFor(localSite(SITES.codebuddy, base), auth)
+    const res = await options.fetch(base + "/v2/chat/completions", { method: "POST", body: "not json" })
+    assert.equal(res.status, 400)
+    assert.equal(count, 1)
+    assert.match((await res.json()).error.message, /渠道校验/)
+  } finally {
+    server.close()
+  }
+})
+
+// ---- 令牌被提前拒（实测 2026-11-18）------------------------------------------
+
+test("令牌被提前拒（401）时换一次令牌重发，成功就当 kept", async () => {
+  let refreshed = 0
+  const sent = []
+  const { server, base } = await startServer((req, raw, res) => {
+    if (req.url === "/v2/plugin/auth/token/refresh") {
+      refreshed++
+      res.end(JSON.stringify({ code: 0, data: { accessToken: "NEW", refreshToken: "RT2", expiresAt: Date.now() + 3600e3 } }))
+      return
+    }
+    sent.push(req.headers.authorization)
+    // 旧令牌被提前拒，新令牌可用
+    if (req.headers.authorization === "Bearer OLD") {
+      res.statusCode = 401
+      res.setHeader("WWW-Authenticate", 'Bearer realm="copilot", error="invalid_token"')
+      res.end("<html>401</html>")
+      return
+    }
+    sse(res)
+  })
+  try {
+    // expires 还在未来：只按到期时间续期的话永远不会刷新
+    const auth = { type: "oauth", access: "OLD", refresh: "RT", expires: Date.now() + 3600e3, uid: "U1" }
+    const { options } = await pluginFor(localSite(SITES.codebuddy, base), auth)
+    const res = await options.fetch(base + "/v2/chat/completions", { method: "POST", body: "{}" })
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get("x-magpie-sign-in"), "kept")
+    assert.equal(refreshed, 1)
+    assert.deepEqual(sent, ["Bearer OLD", "Bearer NEW"])
+  } finally {
+    server.close()
+  }
+})
+
+test("换完令牌还是 401 就说登录失效，不再无限重试", async () => {
+  let refreshed = 0
+  let calls = 0
+  const { server, base } = await startServer((req, raw, res) => {
+    if (req.url === "/v2/plugin/auth/token/refresh") {
+      refreshed++
+      res.end(JSON.stringify({ code: 0, data: { accessToken: "NEW", refreshToken: "RT2" } }))
+      return
+    }
+    calls++
+    res.statusCode = 401
+    res.end("<html>401</html>")
+  })
+  try {
+    const auth = { type: "oauth", access: "OLD", refresh: "RT", expires: Date.now() + 3600e3, uid: "U1" }
+    const { options } = await pluginFor(localSite(SITES.codebuddy, base), auth)
+    const res = await options.fetch(base + "/v2/chat/completions", { method: "POST", body: "{}" })
+    assert.equal(res.status, 401)
+    assert.equal(res.headers.get("x-magpie-sign-in"), "expired")
+    assert.equal(refreshed, 1)
+    assert.equal(calls, 2)
+    assert.match((await res.json()).error.message, /重新登录/)
+  } finally {
+    server.close()
+  }
+})
+
+test("桌面登录的令牌被拒时不花它的 refresh token（会登出 IDE）", async () => {
+  let refreshed = 0
+  const { server, base } = await startServer((req, raw, res) => {
+    if (req.url === "/v2/plugin/auth/token/refresh") {
+      refreshed++
+      res.end(JSON.stringify({ code: 0, data: { accessToken: "NEW" } }))
+      return
+    }
+    res.statusCode = 401
+    res.end("<html>401</html>")
+  })
+  try {
+    const auth = { type: "oauth", access: "OLD", refresh: "RT", expires: 0, uid: "U1", source: "desktop" }
+    // 用国际版：桌面登录文件读的是真文件，它的 domain 是 www.codebuddy.ai，
+    // 指向国区会被跨区检查拦住（那不是这个用例要验的东西）
+    const { options } = await pluginFor(localSite(SITES["codebuddy-intl"], base), auth)
+    const res = await options.fetch(base + "/v2/chat/completions", { method: "POST", body: "{}" })
+    assert.equal(res.status, 401)
+    assert.equal(refreshed, 0)
+    assert.match((await res.json()).error.message, /IDE 里重新登录/)
+  } finally {
+    server.close()
+  }
+})
+
 test("usable 判定：api key 与 oauth 可用，桌面登录也算", () => {
     assert.equal(usable({ type: "api", key: "k" }), true)
   assert.equal(usable({ type: "api", key: "" }), false)
@@ -628,4 +811,56 @@ test("粘贴导入：空文本与无令牌文本都被拒，不造空账号", as
   const noToken = await m.authorize({ account: JSON.stringify({ uid: "u" }) })
   assert.equal(noToken.type, "failed")
   assert.match(noToken.error, /既没有 access_token 也没有 refresh_token/)
+})
+
+// ---- 大请求 + 被拒令牌（实测 2026-11-18）--------------------------------------
+//
+// 实测：坏令牌 + 请求体过 2 MiB，上游前端不回答而是断连或回 550（EdgeOne 自己的码）；
+// 同样体量换好令牌一律是 400/11115（prompt 太长）。所以这两种表现都要报成登录失效，
+// 而不是透成网络错误。
+test("上游回 550（EdgeOne 的重置码）+ 大请求时，报登录失效而不是 550", async () => {
+  const { server, base } = await startServer((req, raw, res) => {
+    if (req.url.includes("billing")) {
+      // 计费接口对同一个坏令牌回 401，它就是判据
+      res.statusCode = 401
+      res.end("<html>401</html>")
+      return
+    }
+    res.statusCode = 550
+    res.end("Response Reset by EdgeOne")
+  })
+  try {
+    const auth = { type: "oauth", access: "BAD", refresh: "", expires: Date.now() + 3600e3, uid: "U1" }
+    const { options } = await pluginFor(localSite(SITES.codebuddy, base), auth)
+    // 必须用不可压缩内容：门槛算在 gzip 后的实际字节上（重复字符压完只剩几 KB）
+    const big = randomBytes(3 << 20).toString("base64")
+    const res = await options.fetch(base + "/v2/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "glm-5.3", messages: [{ role: "system", content: "s" }, { role: "user", content: big }] }),
+    })
+    assert.equal(res.status, 401)
+    assert.equal(res.headers.get("x-magpie-sign-in"), "expired")
+    const body = await res.json()
+    assert.match(body.error.message, /重新登录/)
+    assert.match(body.error.message, /550/)
+  } finally {
+    server.close()
+  }
+})
+
+test("小请求的 550 不被当成登录失效（不误判）", async () => {
+  const { server, base } = await startServer((req, raw, res) => {
+    res.statusCode = 550
+    res.end("Response Reset by EdgeOne")
+  })
+  try {
+    const auth = { type: "oauth", access: "AT", refresh: "", expires: Date.now() + 3600e3, uid: "U1" }
+    const { options } = await pluginFor(localSite(SITES.codebuddy, base), auth)
+    const res = await options.fetch(base + "/v2/chat/completions", { method: "POST", body: "{}" })
+    assert.equal(res.status, 550)
+    // 没到 2 MiB 就不探计费接口，也就不能说账号坏了
+    assert.equal(res.headers.get("x-magpie-sign-in"), "kept")
+  } finally {
+    server.close()
+  }
 })

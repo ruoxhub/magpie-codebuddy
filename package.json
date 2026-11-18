@@ -1,6 +1,6 @@
 {
   "name": "magpie-codebuddy",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "CodeBuddy (Tencent Cloud coding assistant) provider for Magpie: the China build (copilot.tencent.com) and the international one (www.codebuddy.ai), with browser sign-in, the local IDE's sign-in, API keys, credits and daily check-in",
   "type": "module",
   "main": "./opencode.mjs",
@@ -29,6 +29,7 @@
     "opencode2.mjs",
     "lib/",
     "README.md",
+    "REFUSED.md",
     "LICENSE"
   ],
   "scripts": {

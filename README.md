@@ -30,6 +30,8 @@
   - `max_completion_tokens` → `max_tokens`
   - 首条非 `system` 时注入兜底 system
   - 会被上游拒的 Claude Code 开场只加一行身份前缀，原文保留（见下）
+  - 其余会被拒的原话按 `FLAGGED` 逐消息改写（见 [REFUSED.md](./REFUSED.md)）
+  - 11128 仍拒时把 system 提示词搬进 user 消息再发一次（见下）
   - `reasoning_effort` 的 `none` / `off` 按模型能力处理（见下）
   - 恒 `stream: true` 且带 `usage`，并补 `cache_retention: "long"`（见下）
 
@@ -147,7 +149,6 @@ magpie 里选「粘贴 JSON 导入」，把下面任何一种贴进去：
 - `off` 不是上游认识的档位（实测在 `glm-5.2` 上被忽略，仍思考 138 字），所以改写成 `none`。
 
 ## 参考 WorkBuddy 插件后刻意没做的事
-
 WorkBuddy 与 CodeBuddy 是同一个团队的相近产品，WorkBuddy 插件里有大量上游拒答的绕过逻辑。逐条实测了这些机制对 CodeBuddy 是否成立：
 
 | WorkBuddy 里的机制 | CodeBuddy 实测 | 结论 |
@@ -157,10 +158,59 @@ WorkBuddy 与 CodeBuddy 是同一个团队的相近产品，WorkBuddy 插件里�
 | `BAD_SIGNATURE` / 11159 思考签名重试 | 不支持 `thinking` 块，直接 11101 | 不实现 |
 | 工具描述 ≥64KB 时清空 | 70KB 描述 **200** | 不清空 |
 | `AFTER_TOOLS_REFUSED` / 11153（工具结果后跟 user 消息） | **200** | 不实现 |
-| `REFUSED` / `unflagged` 词句改写链 | 未触发 | 不实现 |
-| `enterpriseOf` 企业账号推导 | 签到/余额已带 `X-Enterprise-Id` | 不做额外推导 |
+| `REFUSED` / `unflagged` 词句改写链 | 已移植，见 [REFUSED.md](./REFUSED.md) | 只搬 `FLAGGED` 那张表 || `enterpriseOf` 企业账号推导 | 签到/余额已带 `X-Enterprise-Id` | 不做额外推导 |
 
 写在这里是为了防止后来的人“看 WorkBuddy 有就补上”——那些绕过逻辑每一条都会改写用户的请求，没有对应的上游行为时它们只是纯粹的副作用。
+
+唯一搬过来的是 `FLAGGED` 词句改写链：上游对“来自另一个 agent 的整行原话”的判据是同一个 11128，与 CodeBuddy / WorkBuddy 哪个产品无关，所以整张表带了过来（`lib/outbound.mjs` 的 `unflag`）。表里每一行都对应一条实测，加行之前先看 [REFUSED.md](./REFUSED.md) 里的两条规则。
+
+## 11128 的兜底重发
+
+`FLAGGED` 只认得已知的整行原话，未收录的 agent 开场行还是会 400/11128。所以 11128
+时把 system 提示词搬进首条 user 消息（包在 `<instructions>` 里），system 槽留
+`You are a helpful assistant.`，重发一次。
+
+能过的原因：上游只读 system 与 assistant 两种消息，user 消息不读。实测 2026-11-18
+国际版（`deepseek-v4.1-flash`，`stream: true`，同一账号）：
+
+| 形态 | 结果 |
+|---|---|
+| `You are Claude Code, Anthropic's official CLI for Claude.` 放 system | **400 / 11128** |
+| 同一句包进 user 消息的 `<instructions>` | **200** |
+| 同一句直放 user（无标签） | **200** |
+| 同一句放 assistant 消息 | **400 / 11128** |
+
+（不带 `stream: true` 会被拒成 11101 非流式，看起来像另一个问题。）
+
+被拒过的 system 提示词按文本记在进程内（上限 256 条），同一 agent 的下一轮直接以搬过的
+形态发，不再先被拒一次。
+
+**当前可达性**：已知的被拒行都已经被身份前缀或 `FLAGGED` 接住了，所以这一步现在几乎
+不触发。它是为「上游明天认了一个新行」准备的——前缀规则只认 Claude Code 那一种，
+`FLAGGED` 只认实测过的整行。代价是模型不再以「系统指令」的身份读它，所以它是最后一步。
+
+## 令牌被提前拒、与大请求的断连
+
+两条都是实测出来的：
+
+- **令牌可以远早于 `expires` 就被拒**（浏览器登录的 access 活约 340 天）。所以 401 时
+  换一次 refresh 重发一次，而不是只按到期时间续期。桌面登录不花它的 refresh token
+  （会把 IDE 自己登出，且它的文件每次都重读）；key 没有令牌可换。
+- **坏令牌 + 请求体过大时上游前端不回答**：要么断连（`TypeError: fetch failed` /
+  `ECONNRESET`），要么回一个 **550**（EdgeOne 自己的重置码）。客户端看到的两种都是
+  「网络错误」，看不出是被拒登录。门槛算在 **gzip 后的实际字节**上，不是明文长度。
+
+  实测 2026-11-18 国际版（坏令牌，gzip 发送，每格跑 4 次）：
+
+  | 明文体积 | 结果 |
+  |---|---|
+  | 1 MiB | 401 ×4 |
+  | 2 MiB | ECONNRESET ×2、550 ×2 |
+  | 2.2 MiB | ECONNRESET ×4 |
+  | 3 MiB | 550 ×2、ECONNRESET ×2 |
+
+  同样体量换好令牌一律是 200 或 400/11115（prompt 太长），不断连也不 550。所以两种
+  表现都按「被拒令牌」处理：拿计费接口探一次，它回 401 就报成登录失效。
 
 ## 已知限制
 

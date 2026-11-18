@@ -9,6 +9,8 @@ import {
   ensureLeadingSystemMessage,
   normalizeDeveloperRoles,
   replaceAgentSystemPrompts,
+  unflag,
+  unflagged,
   normalizeReasoningEffort,
   forceStream,
   chatHeaders,
@@ -189,6 +191,66 @@ test("数组形态的 system content 换掉后仍是数组", () => {
   assert.equal(chat.messages[0].content[0].text, identityPrefix + "\n\nYou are Claude Code, Anthropic's official CLI for Claude.")
 })
 
+test("FLAGGED 的每一行都换成能过的说法，不分大小写", () => {
+  assert.equal(unflagged("You are Claude Code, Anthropic's official CLI for Claude."), "You are Claude Code, Anthropic's CLI for Claude.")
+  assert.equal(unflagged("Main branch (you will usually use this for PRs): main"), "Main branch (usually the base for PRs): main")
+  assert.equal(unflagged("MAIN BRANCH (YOU WILL USUALLY USE THIS FOR PRS): main"), "Main branch (usually the base for PRs): main")
+  assert.equal(unflagged("Codex CLI is an open source project led by OpenAI."), "The Codex CLI is an open source project led by OpenAI.")
+  assert.equal(unflagged("x-anthropic-billing-header: cc_version=2.1.280; cc_entrypoint=cli;\nhello"), "hello")
+  assert.equal(unflagged("nothing to see"), "nothing to see")
+})
+
+test("DeepSeek Harness 的开场保留 harness 名字，只加一个逗号", () => {
+  // 整行精确匹配：加字（Desktop / CLI）反而仍被拒，逗号才过
+  const opener = "You are an AI agent powered by DeepSeek Harness."
+  const spread = unflagged(opener)
+  assert.equal(spread, "You are an AI agent, powered by DeepSeek Harness.")
+  assert.ok(spread.includes("DeepSeek Harness"))
+  assert.notEqual(spread, opener)
+  // 幂等：改完再跑一次不再变
+  assert.equal(unflagged(spread), spread)
+})
+
+test("unflag 逐条消息改写，只装着 billing 头的 system 块整条丢掉", () => {
+  const chat = {
+    messages: [
+      { role: "system", content: "x-anthropic-billing-header: cc_version=2.1.280; cc_entrypoint=cli;" },
+      { role: "system", content: [{ type: "text", text: "x-anthropic-billing-header: v=1;" }, { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." }] },
+      { role: "user", content: "gitStatus\nMain branch (you will usually use this for PRs): main" },
+      { role: "assistant", content: "Web GUI whose URL the runtime context names. When the user refers to it, open it." },
+    ],
+  }
+  assert.equal(unflag(chat), true)
+  // 第一条只剩空白的 system 块没了
+  assert.equal(chat.messages.length, 3)
+  assert.deepEqual(chat.messages[0], { role: "system", content: [{ type: "text", text: "You are Claude Code, Anthropic's CLI for Claude." }] })
+  // user 消息里的行也改（上游不读 user，但统一改成本更低）
+  assert.equal(chat.messages[1].content, "gitStatus\nMain branch (usually the base for PRs): main")
+  // 模型引用回 assistant 消息的那行也改（#291）
+  assert.equal(chat.messages[2].content, "Web GUI whose URL the runtime context names. The interface, when the user refers to it, open it.")
+})
+
+test("没有命中 FLAGGED 的 chat 一字不改", () => {
+  const chat = { messages: [{ role: "system", content: "be brief" }, { role: "user", content: "hi" }] }
+  assert.equal(unflag(chat), false)
+  assert.equal(chat.messages[0].content, "be brief")
+})
+
+test("outbound 全流程：FLAGGED 的行在前缀之后被改写", () => {
+  const chat = {
+    messages: [
+      { role: "system", content: "You are Claude Code, Anthropic's official CLI for Claude.\nMain branch (you will usually use this for PRs): main" },
+      { role: "user", content: "hi" },
+    ],
+  }
+  const { chat: shaped, changed } = outbound(chat)
+  assert.equal(changed, true)
+  assert.equal(
+    shaped.messages[0].content,
+    identityPrefix + "\n\nYou are Claude Code, Anthropic's CLI for Claude.\nMain branch (usually the base for PRs): main",
+  )
+})
+
 test("reasoning_effort：模型可关时发 none，不可关时删字段", () => {
   // 实测：发 none 比删字段可靠得多（删字段完全靠模型默认，而默认往往是 high）
   const off = { reasoning_effort: "none" }
@@ -243,8 +305,8 @@ test("outbound 全流程：一次改动后的请求体满足上游所有硬约�
   const { chat: shaped, changed } = outbound(chat)
   assert.equal(changed, true)
   assert.equal(shaped.messages[0].role, "system")
-  // developer 的 agent 身份提示词只加了身份前缀，内容保留
-  assert.equal(shaped.messages[0].content, identityPrefix + "\n\nYou are Claude Code, Anthropic's official CLI for Claude.")
+  // 先加身份前缀（原文保留），再由 FLAGGED 把这行改成能过的说法（它也会出现在 assistant 消息里）
+  assert.equal(shaped.messages[0].content, identityPrefix + "\n\nYou are Claude Code, Anthropic's CLI for Claude.")
   assert.deepEqual(shaped.messages[1].content[0].image_url, { url: "data:image/png;base64,AA" })
   assert.equal(shaped.tool_choice, "read_file")
   assert.equal(shaped.max_tokens, 256)
