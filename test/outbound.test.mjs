@@ -314,6 +314,10 @@ test("chatHeaders 带齐上游校验需要的头", () => {
   assert.equal(h["X-Domain"], site.domain)
   assert.equal(h["User-Agent"], "CLI/2.141.0 CodeBuddy/2.141.0")
   assert.match(h["X-User-Id"], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+  // stainless 头取自当前运行时，不是写死的常量
+  assert.equal(h["x-stainless-runtime-version"], process.version)
+  assert.match(h["x-stainless-arch"], /^(x32|x64|arm|arm64)$/)
+  assert.match(h["x-stainless-os"], /^(Windows|MacOS|Linux|FreeBSD)$/)
 })
 
 test("chatHeaders 每次调用生成独立的 trace 与会话 id", () => {
